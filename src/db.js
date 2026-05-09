@@ -1,0 +1,243 @@
+const path = require('path');
+const fs = require('fs');
+const Database = require('better-sqlite3');
+
+const dataDir = path.join(__dirname, '..', 'data');
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+
+const db = new Database(path.join(dataDir, 'bot.sqlite'));
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS stage_tracking (
+    lead_id INTEGER PRIMARY KEY,
+    stage_id INTEGER,
+    stage_name TEXT,
+    pipeline_id INTEGER,
+    responsible_user_id INTEGER,
+    lead_name TEXT,
+    phone TEXT,
+    entered_at INTEGER,
+    last_notified_at INTEGER DEFAULT 0,
+    notification_count INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS message_tracking (
+    lead_id INTEGER PRIMARY KEY,
+    message_at INTEGER,
+    notified INTEGER DEFAULT 0,
+    notified_at INTEGER DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS user_mapping (
+    amo_user_id INTEGER PRIMARY KEY,
+    telegram_chat_id INTEGER NOT NULL,
+    name TEXT,
+    active INTEGER DEFAULT 1,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS notification_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id INTEGER,
+    amo_user_id INTEGER,
+    telegram_chat_id INTEGER,
+    type TEXT,
+    text TEXT,
+    sent_at INTEGER DEFAULT (strftime('%s','now')),
+    success INTEGER DEFAULT 1,
+    error TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id INTEGER PRIMARY KEY,
+    access_token TEXT,
+    refresh_token TEXT,
+    expires_at INTEGER
+  );
+`);
+
+const stageTracking = {
+  upsert(row) {
+    const existing = db
+      .prepare('SELECT stage_id, entered_at FROM stage_tracking WHERE lead_id = ?')
+      .get(row.lead_id);
+
+    const stageChanged = !existing || existing.stage_id !== row.stage_id;
+    const enteredAt = stageChanged ? row.entered_at || Math.floor(Date.now() / 1000) : existing.entered_at;
+
+    db.prepare(
+      `INSERT INTO stage_tracking
+       (lead_id, stage_id, stage_name, pipeline_id, responsible_user_id, lead_name, phone, entered_at, last_notified_at, notification_count)
+       VALUES (@lead_id, @stage_id, @stage_name, @pipeline_id, @responsible_user_id, @lead_name, @phone, @entered_at, 0, 0)
+       ON CONFLICT(lead_id) DO UPDATE SET
+         stage_id = excluded.stage_id,
+         stage_name = excluded.stage_name,
+         pipeline_id = excluded.pipeline_id,
+         responsible_user_id = excluded.responsible_user_id,
+         lead_name = excluded.lead_name,
+         phone = excluded.phone,
+         entered_at = CASE WHEN stage_tracking.stage_id <> excluded.stage_id THEN excluded.entered_at ELSE stage_tracking.entered_at END,
+         last_notified_at = CASE WHEN stage_tracking.stage_id <> excluded.stage_id THEN 0 ELSE stage_tracking.last_notified_at END,
+         notification_count = CASE WHEN stage_tracking.stage_id <> excluded.stage_id THEN 0 ELSE stage_tracking.notification_count END`
+    ).run({
+      lead_id: row.lead_id,
+      stage_id: row.stage_id,
+      stage_name: row.stage_name || '',
+      pipeline_id: row.pipeline_id || 0,
+      responsible_user_id: row.responsible_user_id || 0,
+      lead_name: row.lead_name || '',
+      phone: row.phone || '',
+      entered_at: enteredAt,
+    });
+
+    return { stageChanged };
+  },
+
+  remove(leadId) {
+    db.prepare('DELETE FROM stage_tracking WHERE lead_id = ?').run(leadId);
+  },
+
+  get(leadId) {
+    return db.prepare('SELECT * FROM stage_tracking WHERE lead_id = ?').get(leadId);
+  },
+
+  findStale(staleSeconds, cooldownSeconds) {
+    const now = Math.floor(Date.now() / 1000);
+    return db
+      .prepare(
+        `SELECT * FROM stage_tracking
+         WHERE entered_at <= ?
+           AND (last_notified_at = 0 OR last_notified_at <= ?)`
+      )
+      .all(now - staleSeconds, now - cooldownSeconds);
+  },
+
+  markNotified(leadId) {
+    const now = Math.floor(Date.now() / 1000);
+    db.prepare(
+      `UPDATE stage_tracking
+       SET last_notified_at = ?, notification_count = notification_count + 1
+       WHERE lead_id = ?`
+    ).run(now, leadId);
+  },
+
+  count() {
+    return db.prepare('SELECT COUNT(*) AS c FROM stage_tracking').get().c;
+  },
+};
+
+const messageTracking = {
+  addIncoming(leadId, messageAt) {
+    db.prepare(
+      `INSERT INTO message_tracking (lead_id, message_at, notified, notified_at)
+       VALUES (?, ?, 0, 0)
+       ON CONFLICT(lead_id) DO UPDATE SET
+         message_at = excluded.message_at,
+         notified = 0,
+         notified_at = 0`
+    ).run(leadId, messageAt || Math.floor(Date.now() / 1000));
+  },
+
+  clearByLead(leadId) {
+    db.prepare('DELETE FROM message_tracking WHERE lead_id = ?').run(leadId);
+  },
+
+  findUnanswered(unansweredSeconds) {
+    const now = Math.floor(Date.now() / 1000);
+    return db
+      .prepare(
+        `SELECT * FROM message_tracking
+         WHERE notified = 0 AND message_at <= ?`
+      )
+      .all(now - unansweredSeconds);
+  },
+
+  markNotified(leadId) {
+    const now = Math.floor(Date.now() / 1000);
+    db.prepare(
+      `UPDATE message_tracking SET notified = 1, notified_at = ? WHERE lead_id = ?`
+    ).run(now, leadId);
+  },
+
+  count() {
+    return db.prepare('SELECT COUNT(*) AS c FROM message_tracking WHERE notified = 0').get().c;
+  },
+};
+
+const userMapping = {
+  upsert(amoUserId, telegramChatId, name) {
+    db.prepare(
+      `INSERT INTO user_mapping (amo_user_id, telegram_chat_id, name, active)
+       VALUES (?, ?, ?, 1)
+       ON CONFLICT(amo_user_id) DO UPDATE SET
+         telegram_chat_id = excluded.telegram_chat_id,
+         name = excluded.name,
+         active = 1`
+    ).run(amoUserId, telegramChatId, name || '');
+  },
+
+  byAmoId(amoUserId) {
+    return db
+      .prepare('SELECT * FROM user_mapping WHERE amo_user_id = ? AND active = 1')
+      .get(amoUserId);
+  },
+
+  byChatId(chatId) {
+    return db
+      .prepare('SELECT * FROM user_mapping WHERE telegram_chat_id = ? AND active = 1')
+      .get(chatId);
+  },
+
+  list() {
+    return db.prepare('SELECT * FROM user_mapping WHERE active = 1 ORDER BY amo_user_id').all();
+  },
+
+  count() {
+    return db.prepare('SELECT COUNT(*) AS c FROM user_mapping WHERE active = 1').get().c;
+  },
+};
+
+const notificationLog = {
+  add(row) {
+    db.prepare(
+      `INSERT INTO notification_log
+       (lead_id, amo_user_id, telegram_chat_id, type, text, success, error)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      row.lead_id || 0,
+      row.amo_user_id || 0,
+      row.telegram_chat_id || 0,
+      row.type || '',
+      row.text || '',
+      row.success ? 1 : 0,
+      row.error || null
+    );
+  },
+};
+
+const tokens = {
+  get() {
+    return db.prepare('SELECT * FROM oauth_tokens WHERE id = 1').get();
+  },
+
+  save({ access_token, refresh_token, expires_at }) {
+    db.prepare(
+      `INSERT INTO oauth_tokens (id, access_token, refresh_token, expires_at)
+       VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         access_token = excluded.access_token,
+         refresh_token = excluded.refresh_token,
+         expires_at = excluded.expires_at`
+    ).run(access_token, refresh_token, expires_at);
+  },
+};
+
+module.exports = {
+  db,
+  stageTracking,
+  messageTracking,
+  userMapping,
+  notificationLog,
+  tokens,
+};
