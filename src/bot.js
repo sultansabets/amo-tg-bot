@@ -59,7 +59,12 @@ function build() {
 
   bot.command('list', async (ctx) => {
     const list = userMapping.list();
-    if (!list.length) return ctx.reply('Пока никто не привязан.');
+    const directAdmins = config.adminTelegramChatIds.filter(
+      (chatId) => !list.some((m) => Number(m.telegram_chat_id) === Number(chatId))
+    );
+
+    if (!list.length && !directAdmins.length) return ctx.reply('Пока никто не привязан.');
+
     const lines = list.map((m) => {
       const isAdmin = m.role === 'admin';
       const prefix = isAdmin ? '🔑' : '👤';
@@ -67,6 +72,11 @@ function build() {
       const name = m.name || '—';
       return `${prefix} ${name} — amo: ${m.amo_user_id} → tg: ${m.telegram_chat_id} — ${roleLabel}`;
     });
+
+    for (const chatId of directAdmins) {
+      lines.push(`🔑 (TG-only) — tg: ${chatId} — админ`);
+    }
+
     await ctx.reply(`👥 Зарегистрированные пользователи:\n${lines.join('\n')}`);
   });
 
@@ -76,7 +86,8 @@ function build() {
       `Лидов в трекинге этапов: ${stageTracking.count()}\n` +
       `Неотвеченных сообщений: ${messageTracking.count()}\n` +
       `Привязанных пользователей: ${userMapping.count()}\n` +
-      `Admins: ${userMapping.countAdmins()}\n\n` +
+      `Admins (amo+TG): ${userMapping.countAdmins()}\n` +
+      `Admins (TG-only): ${config.adminTelegramChatIds.length}\n\n` +
       `⏱️ Пороги:\n` +
       `  STALE_LEAD_MINUTES = ${config.staleLeadMinutes}\n` +
       `  UNANSWERED_MESSAGE_MINUTES = ${config.unansweredMessageMinutes}\n` +
@@ -139,6 +150,7 @@ function build() {
   });
 
   function isAdminChat(chatId) {
+    if (config.adminTelegramChatIds.includes(Number(chatId))) return true;
     const m = userMapping.byChatId(chatId);
     return Boolean(m && m.role === 'admin');
   }
@@ -221,6 +233,7 @@ function build() {
 
   bot.on('message', async (ctx, next) => {
     if (ctx.message.text && ctx.message.text.startsWith('/')) return next();
+    if (config.adminTelegramChatIds.includes(Number(ctx.chat.id))) return;
     const m = userMapping.byChatId(ctx.chat.id);
     if (!m) {
       await ctx.reply(

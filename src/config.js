@@ -45,6 +45,7 @@ module.exports = {
   ignoredStageIds: listEnv('IGNORED_STAGE_IDS'),
 
   adminAmoUserIds: listEnv('ADMIN_AMO_USER_IDS'),
+  adminTelegramChatIds: listEnv('ADMIN_TELEGRAM_CHAT_IDS'),
 
   timezone: 'Asia/Almaty',
 };

@@ -119,42 +119,58 @@ function makeNotifier(bot) {
   }
 
   async function mirrorToAdmins({ originalText, managerName, leadId, type }) {
-    const admins = userMapping.listAdmins();
-    if (!admins.length) return;
+    const mappedAdmins = userMapping.listAdmins();
+    const directChatIds = config.adminTelegramChatIds || [];
+
+    if (!mappedAdmins.length && !directChatIds.length) return;
 
     const header = `👁 Уведомление → ${escapeMd(managerName || '—')}`;
     const adminText = `${header}\n${originalText}`;
 
-    for (const admin of admins) {
+    // Build de-duplicated list: { chatId, amoUserId|null }
+    const targets = [];
+    const seen = new Set();
+    for (const admin of mappedAdmins) {
+      const key = String(admin.telegram_chat_id);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ chatId: admin.telegram_chat_id, amoUserId: admin.amo_user_id });
+    }
+    for (const chatId of directChatIds) {
+      const key = String(chatId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      targets.push({ chatId, amoUserId: 0 });
+    }
+
+    for (const t of targets) {
       try {
-        const result = await bot.telegram.sendMessage(admin.telegram_chat_id, adminText, {
+        const result = await bot.telegram.sendMessage(t.chatId, adminText, {
           parse_mode: 'MarkdownV2',
           link_preview_options: { is_disabled: true },
         });
         if (leadId) {
           adminMessages.add({
             lead_id: leadId,
-            admin_chat_id: admin.telegram_chat_id,
+            admin_chat_id: t.chatId,
             telegram_message_id: result.message_id,
             type: type || 'mirror',
           });
         }
         notificationLog.add({
           lead_id: leadId || 0,
-          amo_user_id: admin.amo_user_id,
-          telegram_chat_id: admin.telegram_chat_id,
+          amo_user_id: t.amoUserId,
+          telegram_chat_id: t.chatId,
           type: `admin_mirror:${type || ''}`,
           text: adminText,
           success: true,
         });
       } catch (err) {
-        console.warn(
-          `⚠️ Admin mirror to chat=${admin.telegram_chat_id} failed: ${err.message}`
-        );
+        console.warn(`⚠️ Admin mirror to chat=${t.chatId} failed: ${err.message}`);
         notificationLog.add({
           lead_id: leadId || 0,
-          amo_user_id: admin.amo_user_id,
-          telegram_chat_id: admin.telegram_chat_id,
+          amo_user_id: t.amoUserId,
+          telegram_chat_id: t.chatId,
           type: `admin_mirror:${type || ''}`,
           text: adminText,
           success: false,
