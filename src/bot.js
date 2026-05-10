@@ -1,7 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const config = require('./config');
 const amocrm = require('./amocrm');
-const { userMapping, stageTracking, messageTracking, db } = require('./db');
+const { userMapping, stageTracking, messageTracking, db, adminChats } = require('./db');
 const {
   buildStaleMessage,
   makeNotifier,
@@ -34,47 +34,61 @@ function build() {
       (ctx.from && (ctx.from.first_name || '') + ' ' + (ctx.from.last_name || '')).trim() ||
       ctx.from.username ||
       '';
-    const role = config.adminAmoUserIds.includes(amoId) ? 'admin' : 'manager';
-    userMapping.upsert(amoId, ctx.chat.id, name, role);
 
-    const msg =
-      role === 'admin'
-        ? `✅ Ты зарегистрирован как администратор. Будешь получать уведомления по всем менеджерам.`
-        : `✅ Ты зарегистрирован как менеджер. Будешь получать уведомления только по своим лидам.`;
-    await ctx.reply(msg);
+    if (config.adminAmoUserIds.includes(amoId)) {
+      // Admin path: many telegram chats may share the same amo_user_id
+      adminChats.upsert(ctx.chat.id, amoId, name);
+      // Make sure this chat isn't also tracked as a manager
+      db.prepare('DELETE FROM user_mapping WHERE telegram_chat_id = ?').run(ctx.chat.id);
+      return ctx.reply(
+        `✅ Ты зарегистрирован как администратор. Будешь получать уведомления по всем менеджерам.`
+      );
+    }
+
+    // Manager path
+    userMapping.upsert(amoId, ctx.chat.id, name, 'manager');
+    adminChats.remove(ctx.chat.id);
+    await ctx.reply(
+      `✅ Ты зарегистрирован как менеджер. Будешь получать уведомления только по своим лидам.`
+    );
   });
 
   bot.command('whoami', async (ctx) => {
+    const a = adminChats.byChatId(ctx.chat.id);
+    if (a) {
+      return ctx.reply(
+        `amo_user_id: ${a.amo_user_id}\nchat_id: ${a.telegram_chat_id}\nИмя: ${a.name || '—'}\nРоль: админ 🔑`
+      );
+    }
     const m = userMapping.byChatId(ctx.chat.id);
     if (!m) {
       return ctx.reply(
         `Вы не привязаны.\nВаш chat_id: ${ctx.chat.id}\nИспользуйте /addme <amo_user_id>`
       );
     }
-    const roleLabel = m.role === 'admin' ? 'админ 🔑' : 'менеджер';
     await ctx.reply(
-      `amo_user_id: ${m.amo_user_id}\nchat_id: ${m.telegram_chat_id}\nИмя: ${m.name || '—'}\nРоль: ${roleLabel}`
+      `amo_user_id: ${m.amo_user_id}\nchat_id: ${m.telegram_chat_id}\nИмя: ${m.name || '—'}\nРоль: менеджер`
     );
   });
 
   bot.command('list', async (ctx) => {
-    const list = userMapping.list();
-    const directAdmins = config.adminTelegramChatIds.filter(
-      (chatId) => !list.some((m) => Number(m.telegram_chat_id) === Number(chatId))
-    );
+    const managers = userMapping.list();
+    const admins = adminChats.list();
 
-    if (!list.length && !directAdmins.length) return ctx.reply('Пока никто не привязан.');
+    if (!managers.length && !admins.length) return ctx.reply('Пока никто не привязан.');
 
-    const lines = list.map((m) => {
-      const isAdmin = m.role === 'admin';
-      const prefix = isAdmin ? '🔑' : '👤';
-      const roleLabel = isAdmin ? 'админ' : 'менеджер';
+    const lines = [];
+    for (const a of admins) {
+      const name = a.name || '—';
+      lines.push(
+        `🔑 ${name} — amo: ${a.amo_user_id} → tg: ${a.telegram_chat_id} — админ`
+      );
+    }
+    for (const m of managers) {
       const name = m.name || '—';
-      return `${prefix} ${name} — amo: ${m.amo_user_id} → tg: ${m.telegram_chat_id} — ${roleLabel}`;
-    });
-
-    for (const chatId of directAdmins) {
-      lines.push(`🔑 (TG-only) — tg: ${chatId} — админ`);
+      lines.push(
+        `👤 ${name} — amo: ${m.amo_user_id} → tg: ${m.telegram_chat_id} — менеджер`
+      );
     }
 
     await ctx.reply(`👥 Зарегистрированные пользователи:\n${lines.join('\n')}`);
@@ -85,9 +99,8 @@ function build() {
       `📊 Статус\n\n` +
       `Лидов в трекинге этапов: ${stageTracking.count()}\n` +
       `Неотвеченных сообщений: ${messageTracking.count()}\n` +
-      `Привязанных пользователей: ${userMapping.count()}\n` +
-      `Admins (amo+TG): ${userMapping.countAdmins()}\n` +
-      `Admins (TG-only): ${config.adminTelegramChatIds.length}\n\n` +
+      `Менеджеров: ${userMapping.count()}\n` +
+      `Админов: ${adminChats.count()}\n\n` +
       `⏱️ Пороги:\n` +
       `  STALE_LEAD_MINUTES = ${config.staleLeadMinutes}\n` +
       `  UNANSWERED_MESSAGE_MINUTES = ${config.unansweredMessageMinutes}\n` +
@@ -150,9 +163,7 @@ function build() {
   });
 
   function isAdminChat(chatId) {
-    if (config.adminTelegramChatIds.includes(Number(chatId))) return true;
-    const m = userMapping.byChatId(chatId);
-    return Boolean(m && m.role === 'admin');
+    return Boolean(adminChats.byChatId(chatId));
   }
 
   bot.action('report_all', async (ctx) => {
@@ -233,7 +244,7 @@ function build() {
 
   bot.on('message', async (ctx, next) => {
     if (ctx.message.text && ctx.message.text.startsWith('/')) return next();
-    if (config.adminTelegramChatIds.includes(Number(ctx.chat.id))) return;
+    if (isAdminChat(ctx.chat.id)) return;
     const m = userMapping.byChatId(ctx.chat.id);
     if (!m) {
       await ctx.reply(

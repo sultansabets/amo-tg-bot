@@ -67,6 +67,13 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_admin_messages_lead ON admin_messages(lead_id, resolved);
+
+  CREATE TABLE IF NOT EXISTS admin_chats (
+    telegram_chat_id INTEGER PRIMARY KEY,
+    amo_user_id      INTEGER,
+    name             TEXT,
+    created_at       INTEGER DEFAULT (strftime('%s','now'))
+  );
 `);
 
 // Safe migration: add role column if missing
@@ -240,6 +247,36 @@ const userMapping = {
   },
 };
 
+const adminChats = {
+  upsert(chatId, amoUserId, name) {
+    db.prepare(
+      `INSERT INTO admin_chats (telegram_chat_id, amo_user_id, name)
+       VALUES (?, ?, ?)
+       ON CONFLICT(telegram_chat_id) DO UPDATE SET
+         amo_user_id = excluded.amo_user_id,
+         name = excluded.name`
+    ).run(chatId, amoUserId || 0, name || '');
+  },
+
+  remove(chatId) {
+    db.prepare('DELETE FROM admin_chats WHERE telegram_chat_id = ?').run(chatId);
+  },
+
+  list() {
+    return db.prepare('SELECT * FROM admin_chats ORDER BY created_at').all();
+  },
+
+  byChatId(chatId) {
+    return db
+      .prepare('SELECT * FROM admin_chats WHERE telegram_chat_id = ?')
+      .get(chatId);
+  },
+
+  count() {
+    return db.prepare('SELECT COUNT(*) AS c FROM admin_chats').get().c;
+  },
+};
+
 const adminMessages = {
   add({ lead_id, admin_chat_id, telegram_message_id, type }) {
     db.prepare(
@@ -316,4 +353,5 @@ module.exports = {
   notificationLog,
   tokens,
   adminMessages,
+  adminChats,
 };
