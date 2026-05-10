@@ -55,7 +55,29 @@ db.exec(`
     refresh_token TEXT,
     expires_at INTEGER
   );
+
+  CREATE TABLE IF NOT EXISTS admin_messages (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id             INTEGER NOT NULL,
+    admin_chat_id       TEXT NOT NULL,
+    telegram_message_id INTEGER NOT NULL,
+    type                TEXT NOT NULL,
+    sent_at             INTEGER NOT NULL,
+    resolved            INTEGER DEFAULT 0
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_admin_messages_lead ON admin_messages(lead_id, resolved);
 `);
+
+// Safe migration: add role column if missing
+try {
+  db.prepare(`ALTER TABLE user_mapping ADD COLUMN role TEXT DEFAULT 'manager'`).run();
+  console.log("✅ Migration: added 'role' column to user_mapping");
+} catch (err) {
+  if (!/duplicate column/i.test(err.message)) {
+    console.warn(`⚠️ Migration check: ${err.message}`);
+  }
+}
 
 const stageTracking = {
   upsert(row) {
@@ -166,15 +188,17 @@ const messageTracking = {
 };
 
 const userMapping = {
-  upsert(amoUserId, telegramChatId, name) {
+  upsert(amoUserId, telegramChatId, name, role) {
+    const finalRole = role === 'admin' ? 'admin' : 'manager';
     db.prepare(
-      `INSERT INTO user_mapping (amo_user_id, telegram_chat_id, name, active)
-       VALUES (?, ?, ?, 1)
+      `INSERT INTO user_mapping (amo_user_id, telegram_chat_id, name, active, role)
+       VALUES (?, ?, ?, 1, ?)
        ON CONFLICT(amo_user_id) DO UPDATE SET
          telegram_chat_id = excluded.telegram_chat_id,
          name = excluded.name,
-         active = 1`
-    ).run(amoUserId, telegramChatId, name || '');
+         active = 1,
+         role = excluded.role`
+    ).run(amoUserId, telegramChatId, name || '', finalRole);
   },
 
   byAmoId(amoUserId) {
@@ -190,11 +214,62 @@ const userMapping = {
   },
 
   list() {
-    return db.prepare('SELECT * FROM user_mapping WHERE active = 1 ORDER BY amo_user_id').all();
+    return db.prepare('SELECT * FROM user_mapping WHERE active = 1 ORDER BY role DESC, amo_user_id').all();
+  },
+
+  listAdmins() {
+    return db
+      .prepare("SELECT * FROM user_mapping WHERE active = 1 AND role = 'admin'")
+      .all();
+  },
+
+  listManagers() {
+    return db
+      .prepare("SELECT * FROM user_mapping WHERE active = 1 AND role = 'manager' ORDER BY name")
+      .all();
   },
 
   count() {
     return db.prepare('SELECT COUNT(*) AS c FROM user_mapping WHERE active = 1').get().c;
+  },
+
+  countAdmins() {
+    return db
+      .prepare("SELECT COUNT(*) AS c FROM user_mapping WHERE active = 1 AND role = 'admin'")
+      .get().c;
+  },
+};
+
+const adminMessages = {
+  add({ lead_id, admin_chat_id, telegram_message_id, type }) {
+    db.prepare(
+      `INSERT INTO admin_messages (lead_id, admin_chat_id, telegram_message_id, type, sent_at, resolved)
+       VALUES (?, ?, ?, ?, ?, 0)`
+    ).run(
+      lead_id,
+      String(admin_chat_id),
+      telegram_message_id,
+      type || '',
+      Math.floor(Date.now() / 1000)
+    );
+  },
+
+  unresolvedByLead(leadId) {
+    return db
+      .prepare(
+        `SELECT * FROM admin_messages WHERE lead_id = ? AND resolved = 0`
+      )
+      .all(leadId);
+  },
+
+  markResolved(id) {
+    db.prepare(`UPDATE admin_messages SET resolved = 1 WHERE id = ?`).run(id);
+  },
+
+  markResolvedByLead(leadId) {
+    db.prepare(
+      `UPDATE admin_messages SET resolved = 1 WHERE lead_id = ? AND resolved = 0`
+    ).run(leadId);
   },
 };
 
@@ -240,4 +315,5 @@ module.exports = {
   userMapping,
   notificationLog,
   tokens,
+  adminMessages,
 };

@@ -44,5 +44,7 @@ module.exports = {
   monitoredStageIds: listEnv('MONITORED_STAGE_IDS'),
   ignoredStageIds: listEnv('IGNORED_STAGE_IDS'),
 
+  adminAmoUserIds: listEnv('ADMIN_AMO_USER_IDS'),
+
   timezone: 'Asia/Almaty',
 };

@@ -1,5 +1,5 @@
 const config = require('./config');
-const { userMapping, notificationLog } = require('./db');
+const { userMapping, notificationLog, adminMessages, messageTracking } = require('./db');
 
 const MD_SPECIALS = /[_*\[\]()~`>#+\-=|{}.!\\]/g;
 function escapeMd(text) {
@@ -99,12 +99,12 @@ function buildUnansweredMessage({ leadId, stageName, leadName, phone, messageAt,
 function makeNotifier(bot) {
   async function sendToChat(chatId, text, meta = {}) {
     try {
-      await bot.telegram.sendMessage(chatId, text, {
+      const result = await bot.telegram.sendMessage(chatId, text, {
         parse_mode: 'MarkdownV2',
         link_preview_options: { is_disabled: true },
       });
       notificationLog.add({ ...meta, telegram_chat_id: chatId, text, success: true });
-      return true;
+      return { ok: true, message_id: result.message_id };
     } catch (err) {
       console.error(`❌ Telegram send to ${chatId} failed: ${err.message}`);
       notificationLog.add({
@@ -114,7 +114,53 @@ function makeNotifier(bot) {
         success: false,
         error: err.message,
       });
-      return false;
+      return { ok: false, error: err.message };
+    }
+  }
+
+  async function mirrorToAdmins({ originalText, managerName, leadId, type }) {
+    const admins = userMapping.listAdmins();
+    if (!admins.length) return;
+
+    const header = `👁 Уведомление → ${escapeMd(managerName || '—')}`;
+    const adminText = `${header}\n${originalText}`;
+
+    for (const admin of admins) {
+      try {
+        const result = await bot.telegram.sendMessage(admin.telegram_chat_id, adminText, {
+          parse_mode: 'MarkdownV2',
+          link_preview_options: { is_disabled: true },
+        });
+        if (leadId) {
+          adminMessages.add({
+            lead_id: leadId,
+            admin_chat_id: admin.telegram_chat_id,
+            telegram_message_id: result.message_id,
+            type: type || 'mirror',
+          });
+        }
+        notificationLog.add({
+          lead_id: leadId || 0,
+          amo_user_id: admin.amo_user_id,
+          telegram_chat_id: admin.telegram_chat_id,
+          type: `admin_mirror:${type || ''}`,
+          text: adminText,
+          success: true,
+        });
+      } catch (err) {
+        console.warn(
+          `⚠️ Admin mirror to chat=${admin.telegram_chat_id} failed: ${err.message}`
+        );
+        notificationLog.add({
+          lead_id: leadId || 0,
+          amo_user_id: admin.amo_user_id,
+          telegram_chat_id: admin.telegram_chat_id,
+          type: `admin_mirror:${type || ''}`,
+          text: adminText,
+          success: false,
+          error: err.message,
+        });
+      }
     }
   }
 
@@ -124,19 +170,80 @@ function makeNotifier(bot) {
       return false;
     }
     const mapping = userMapping.byAmoId(amoUserId);
+    let managerName = '';
+    let managerSent = false;
+
     if (!mapping) {
       console.warn(`⚠️ No telegram mapping for amo_user_id=${amoUserId}`);
-      return false;
+      managerName = `amo_id=${amoUserId}`;
+    } else {
+      managerName = mapping.name || `amo_id=${amoUserId}`;
+      const sendRes = await sendToChat(mapping.telegram_chat_id, text, {
+        ...meta,
+        amo_user_id: amoUserId,
+      });
+      managerSent = sendRes.ok;
     }
-    return await sendToChat(mapping.telegram_chat_id, text, {
-      ...meta,
-      amo_user_id: amoUserId,
+
+    // Admin mirror — runs even if manager isn't mapped, so admins always see alerts.
+    await mirrorToAdmins({
+      originalText: text,
+      managerName,
+      leadId: meta.lead_id,
+      type: meta.type,
     });
+
+    return managerSent;
+  }
+
+  async function resolveLead(leadId, leadName, managerName) {
+    if (!leadId) return;
+
+    const rows = adminMessages.unresolvedByLead(leadId);
+    const seenChats = new Set();
+
+    for (const row of rows) {
+      try {
+        await bot.telegram.deleteMessage(row.admin_chat_id, row.telegram_message_id);
+      } catch (err) {
+        // Silent — message could already be deleted, too old, or chat blocked
+      }
+      adminMessages.markResolved(row.id);
+      seenChats.add(String(row.admin_chat_id));
+    }
+
+    if (seenChats.size > 0) {
+      console.log(`🗑 Resolved lead ${leadId}: ${rows.length} admin messages cleared`);
+    }
+
+    const url = buildLeadUrl(leadId);
+    const resolvedText = [
+      `✅ Отработан — ${escapeMd(managerName || '—')}`,
+      `📎 [Открыть в amoCRM](${escapeMd(url)})`,
+      `👤 ${escapeMd(leadName || '—')}`,
+      `🕐 Отработан: ${escapeMd(formatTimestamp(Math.floor(Date.now() / 1000)))}`,
+    ].join('\n');
+
+    for (const chatId of seenChats) {
+      try {
+        await bot.telegram.sendMessage(chatId, resolvedText, {
+          parse_mode: 'MarkdownV2',
+          link_preview_options: { is_disabled: true },
+        });
+      } catch (err) {
+        console.warn(`⚠️ Resolved-notice to chat=${chatId} failed: ${err.message}`);
+      }
+    }
+
+    try {
+      messageTracking.markNotified(leadId);
+    } catch (_) {}
   }
 
   return {
     sendToChat,
     notifyAmoUser,
+    resolveLead,
   };
 }
 

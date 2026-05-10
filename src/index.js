@@ -9,7 +9,7 @@ async function main() {
 
   const app = express();
   app.disable('x-powered-by');
-  app.use(buildRouter());
+  app.use(buildRouter(notifier));
 
   app.listen(config.port, () => {
     console.log(`✅ HTTP server listening on :${config.port}`);

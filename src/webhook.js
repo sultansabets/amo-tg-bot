@@ -1,7 +1,7 @@
 const express = require('express');
 const config = require('./config');
 const amocrm = require('./amocrm');
-const { stageTracking, messageTracking } = require('./db');
+const { stageTracking, messageTracking, userMapping } = require('./db');
 
 function parseAmoForm(body) {
   // amoCRM webhooks come as application/x-www-form-urlencoded with nested keys
@@ -36,14 +36,33 @@ function isMonitoredStage(statusId) {
   return config.monitoredStageIds.includes(parseInt(statusId, 10));
 }
 
-async function processLeadEvent(leadObj) {
+function resolveContext(leadId, leadInfo) {
+  const cached = stageTracking.get(leadId);
+  const responsibleId =
+    (leadInfo && leadInfo.lead && leadInfo.lead.responsible_user_id) ||
+    (cached && cached.responsible_user_id) ||
+    0;
+  const manager = responsibleId ? userMapping.byAmoId(responsibleId) : null;
+  const managerName =
+    (manager && manager.name) || (responsibleId ? `amo_id=${responsibleId}` : '—');
+  const leadName =
+    (leadInfo && leadInfo.lead && (leadInfo.lead.name || leadInfo.contactName)) ||
+    (cached && cached.lead_name) ||
+    `Лид #${leadId}`;
+  return { managerName, leadName };
+}
+
+async function processLeadEvent(leadObj, notifier) {
   const leadId = parseInt(leadObj.id, 10);
   if (!leadId) return;
 
   const statusId = parseInt(leadObj.status_id, 10);
   if (statusId && isIgnoredStage(statusId)) {
+    const ctx = resolveContext(leadId, null);
+    if (notifier && notifier.resolveLead) {
+      await notifier.resolveLead(leadId, ctx.leadName, ctx.managerName);
+    }
     stageTracking.remove(leadId);
-    messageTracking.clearByLead(leadId);
     console.log(`📨 Lead ${leadId} entered ignored stage ${statusId} — removed from tracking`);
     return;
   }
@@ -61,8 +80,11 @@ async function processLeadEvent(leadObj) {
   const { lead, phone, contactName, stageName } = info;
 
   if (lead.status_id && isIgnoredStage(lead.status_id)) {
+    const ctx = resolveContext(leadId, info);
+    if (notifier && notifier.resolveLead) {
+      await notifier.resolveLead(leadId, ctx.leadName, ctx.managerName);
+    }
     stageTracking.remove(leadId);
-    messageTracking.clearByLead(leadId);
     return;
   }
   if (lead.status_id && !isMonitoredStage(lead.status_id)) {
@@ -83,7 +105,7 @@ async function processLeadEvent(leadObj) {
   console.log(`📨 Lead ${leadId} upserted into stage_tracking (stage=${stageName})`);
 }
 
-async function processNoteEvent(noteObj) {
+async function processNoteEvent(noteObj, notifier) {
   const leadId = parseInt(noteObj.element_id || noteObj.entity_id, 10);
   const noteType = parseInt(noteObj.note_type, 10);
   if (!leadId || !noteType) return;
@@ -95,12 +117,15 @@ async function processNoteEvent(noteObj) {
     messageTracking.addIncoming(leadId, Math.floor(Date.now() / 1000));
     console.log(`📥 Lead ${leadId}: incoming note (type=${noteType})`);
   } else if (outgoing.includes(noteType)) {
-    messageTracking.clearByLead(leadId);
-    console.log(`📤 Lead ${leadId}: outgoing reply (type=${noteType}) — cleared`);
+    const ctx = resolveContext(leadId, null);
+    if (notifier && notifier.resolveLead) {
+      await notifier.resolveLead(leadId, ctx.leadName, ctx.managerName);
+    }
+    console.log(`📤 Lead ${leadId}: outgoing reply (type=${noteType}) — resolved`);
   }
 }
 
-function buildRouter() {
+function buildRouter(notifier) {
   const router = express.Router();
 
   router.use(express.urlencoded({ extended: true, limit: '2mb' }));
@@ -117,19 +142,22 @@ function buildRouter() {
       try {
         const leads = collectEntities(payload, 'leads');
         for (const lead of [...leads.add, ...leads.update, ...leads.status]) {
-          await processLeadEvent(lead);
+          await processLeadEvent(lead, notifier);
         }
         for (const lead of leads.delete) {
           const id = parseInt(lead.id, 10);
           if (id) {
+            const ctx = resolveContext(id, null);
+            if (notifier && notifier.resolveLead) {
+              await notifier.resolveLead(id, ctx.leadName, ctx.managerName);
+            }
             stageTracking.remove(id);
-            messageTracking.clearByLead(id);
           }
         }
 
         const notes = collectEntities(payload, 'note');
         for (const note of [...notes.add, ...notes.update]) {
-          await processNoteEvent(note);
+          await processNoteEvent(note, notifier);
         }
       } catch (err) {
         console.error(`❌ Webhook processing failed: ${err.message}`);

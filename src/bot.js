@@ -1,11 +1,12 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const config = require('./config');
 const amocrm = require('./amocrm');
-const { userMapping, stageTracking, messageTracking } = require('./db');
+const { userMapping, stageTracking, messageTracking, db } = require('./db');
 const {
   buildStaleMessage,
   makeNotifier,
   escapeMd,
+  buildLeadUrl,
 } = require('./notifier');
 
 function build() {
@@ -33,8 +34,14 @@ function build() {
       (ctx.from && (ctx.from.first_name || '') + ' ' + (ctx.from.last_name || '')).trim() ||
       ctx.from.username ||
       '';
-    userMapping.upsert(amoId, ctx.chat.id, name);
-    await ctx.reply(`✅ Сохранено: amo_user_id=${amoId} → chat_id=${ctx.chat.id}`);
+    const role = config.adminAmoUserIds.includes(amoId) ? 'admin' : 'manager';
+    userMapping.upsert(amoId, ctx.chat.id, name, role);
+
+    const msg =
+      role === 'admin'
+        ? `✅ Ты зарегистрирован как администратор. Будешь получать уведомления по всем менеджерам.`
+        : `✅ Ты зарегистрирован как менеджер. Будешь получать уведомления только по своим лидам.`;
+    await ctx.reply(msg);
   });
 
   bot.command('whoami', async (ctx) => {
@@ -44,18 +51,23 @@ function build() {
         `Вы не привязаны.\nВаш chat_id: ${ctx.chat.id}\nИспользуйте /addme <amo_user_id>`
       );
     }
+    const roleLabel = m.role === 'admin' ? 'админ 🔑' : 'менеджер';
     await ctx.reply(
-      `amo_user_id: ${m.amo_user_id}\nchat_id: ${m.telegram_chat_id}\nИмя: ${m.name || '—'}`
+      `amo_user_id: ${m.amo_user_id}\nchat_id: ${m.telegram_chat_id}\nИмя: ${m.name || '—'}\nРоль: ${roleLabel}`
     );
   });
 
   bot.command('list', async (ctx) => {
     const list = userMapping.list();
     if (!list.length) return ctx.reply('Пока никто не привязан.');
-    const lines = list.map(
-      (m) => `• amo=${m.amo_user_id} → tg=${m.telegram_chat_id}  ${m.name || ''}`
-    );
-    await ctx.reply(`Активные привязки:\n${lines.join('\n')}`);
+    const lines = list.map((m) => {
+      const isAdmin = m.role === 'admin';
+      const prefix = isAdmin ? '🔑' : '👤';
+      const roleLabel = isAdmin ? 'админ' : 'менеджер';
+      const name = m.name || '—';
+      return `${prefix} ${name} — amo: ${m.amo_user_id} → tg: ${m.telegram_chat_id} — ${roleLabel}`;
+    });
+    await ctx.reply(`👥 Зарегистрированные пользователи:\n${lines.join('\n')}`);
   });
 
   bot.command('status', async (ctx) => {
@@ -63,7 +75,8 @@ function build() {
       `📊 Статус\n\n` +
       `Лидов в трекинге этапов: ${stageTracking.count()}\n` +
       `Неотвеченных сообщений: ${messageTracking.count()}\n` +
-      `Привязанных пользователей: ${userMapping.count()}\n\n` +
+      `Привязанных пользователей: ${userMapping.count()}\n` +
+      `Admins: ${userMapping.countAdmins()}\n\n` +
       `⏱️ Пороги:\n` +
       `  STALE_LEAD_MINUTES = ${config.staleLeadMinutes}\n` +
       `  UNANSWERED_MESSAGE_MINUTES = ${config.unansweredMessageMinutes}\n` +
@@ -94,11 +107,116 @@ function build() {
       hasOpenTask: info.hasOpenTask,
     });
 
-    const ok = await notifier.sendToChat(ctx.chat.id, text, {
+    const res = await notifier.sendToChat(ctx.chat.id, text, {
       lead_id: leadId,
       type: 'test',
     });
-    if (!ok) await ctx.reply('❌ Не удалось отправить тестовое уведомление');
+    if (!res || !res.ok) await ctx.reply('❌ Не удалось отправить тестовое уведомление');
+  });
+
+  bot.command('report', async (ctx) => {
+    const me = userMapping.byChatId(ctx.chat.id);
+    if (!me || me.role !== 'admin') {
+      return ctx.reply('⛔ Недостаточно прав');
+    }
+
+    const managers = userMapping.listManagers();
+    if (!managers.length) {
+      return ctx.reply('❌ Нет зарегистрированных менеджеров');
+    }
+
+    const buttons = [[Markup.button.callback('📋 Общий по всем', 'report_all')]];
+    for (const m of managers) {
+      buttons.push([
+        Markup.button.callback(
+          `👤 ${m.name || `amo=${m.amo_user_id}`}`,
+          `report_manager_${m.amo_user_id}`
+        ),
+      ]);
+    }
+
+    await ctx.reply('Выберите отчёт:', Markup.inlineKeyboard(buttons));
+  });
+
+  function isAdminChat(chatId) {
+    const m = userMapping.byChatId(chatId);
+    return Boolean(m && m.role === 'admin');
+  }
+
+  bot.action('report_all', async (ctx) => {
+    try {
+      if (!isAdminChat(ctx.chat.id)) {
+        await ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+        return;
+      }
+
+      const managers = userMapping.listManagers();
+      const lines = ['📊 Общий отчёт — необработанные лиды', ''];
+
+      const leadsByManager = db
+        .prepare(
+          `SELECT lead_id, responsible_user_id FROM stage_tracking ORDER BY entered_at`
+        )
+        .all();
+
+      for (const m of managers) {
+        const list = leadsByManager.filter(
+          (r) => r.responsible_user_id === m.amo_user_id
+        );
+        if (!list.length) {
+          lines.push(`👤 ${m.name || 'amo=' + m.amo_user_id} (0): ✅ чисто`);
+        } else {
+          lines.push(`👤 ${m.name || 'amo=' + m.amo_user_id} (${list.length}):`);
+          for (const row of list) {
+            lines.push(buildLeadUrl(row.lead_id));
+          }
+        }
+        lines.push('');
+      }
+
+      await ctx.reply(lines.join('\n').trim(), {
+        link_preview_options: { is_disabled: true },
+      });
+      await ctx.answerCbQuery();
+    } catch (err) {
+      console.error(`❌ report_all failed: ${err.message}`);
+      try {
+        await ctx.answerCbQuery('Ошибка');
+      } catch (_) {}
+    }
+  });
+
+  bot.action(/^report_manager_(\d+)$/, async (ctx) => {
+    try {
+      if (!isAdminChat(ctx.chat.id)) {
+        await ctx.answerCbQuery('⛔ Недостаточно прав', { show_alert: true });
+        return;
+      }
+      const amoUserId = parseInt(ctx.match[1], 10);
+      const m = userMapping.byAmoId(amoUserId);
+      const managerName = (m && m.name) || `amo=${amoUserId}`;
+
+      const list = db
+        .prepare(
+          `SELECT lead_id FROM stage_tracking WHERE responsible_user_id = ? ORDER BY entered_at`
+        )
+        .all(amoUserId);
+
+      let text;
+      if (!list.length) {
+        text = `📊 ${managerName} — ✅ необработанных нет`;
+      } else {
+        const urls = list.map((r) => buildLeadUrl(r.lead_id));
+        text = `📊 ${managerName} (${list.length}):\n${urls.join('\n')}`;
+      }
+      await ctx.reply(text, { link_preview_options: { is_disabled: true } });
+      await ctx.answerCbQuery();
+    } catch (err) {
+      console.error(`❌ report_manager failed: ${err.message}`);
+      try {
+        await ctx.answerCbQuery('Ошибка');
+      } catch (_) {}
+    }
   });
 
   bot.on('message', async (ctx, next) => {
