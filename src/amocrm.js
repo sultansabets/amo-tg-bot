@@ -125,7 +125,30 @@ async function getValidAccessToken() {
   throw new Error('No amoCRM token available — perform OAuth first via /amo/oauth');
 }
 
+// Global rate limiter: amoCRM default quota is 7 req/sec per account.
+// We hold to 5 req/sec to leave headroom for webhooks, retries, and bursts.
+// Requests above the cap queue and wait, never get dropped.
+const RATE_LIMIT_PER_SEC = 5;
+const RATE_LIMIT_WINDOW_MS = 1000;
+const recentRequests = [];
+
+async function rateLimit() {
+  while (true) {
+    const now = Date.now();
+    while (recentRequests.length && recentRequests[0] <= now - RATE_LIMIT_WINDOW_MS) {
+      recentRequests.shift();
+    }
+    if (recentRequests.length < RATE_LIMIT_PER_SEC) {
+      recentRequests.push(now);
+      return;
+    }
+    const waitMs = RATE_LIMIT_WINDOW_MS - (now - recentRequests[0]) + 5;
+    await new Promise((r) => setTimeout(r, waitMs));
+  }
+}
+
 async function request(method, url, options = {}, _retried = false) {
+  await rateLimit();
   try {
     const token = await getValidAccessToken();
     const apiBase = resolveApiBaseURL();
@@ -153,6 +176,13 @@ async function request(method, url, options = {}, _retried = false) {
         console.error('❌ amoCRM refresh failed:', e.message);
         return null;
       }
+    }
+    // 429 Too Many Requests — wait and retry once
+    if (status === 429 && !_retried) {
+      const retryAfter = parseInt(err.response.headers['retry-after'], 10) || 5;
+      console.warn(`⚠️ amoCRM 429 rate-limited, waiting ${retryAfter}s before retry`);
+      await new Promise((r) => setTimeout(r, retryAfter * 1000));
+      return await request(method, url, options, true);
     }
     if (status === 204 || status === 404) return null;
     console.error(`❌ amoCRM ${method} ${url}: ${err.message}${status ? ' [' + status + ']' : ''}`);
