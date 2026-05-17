@@ -118,6 +118,18 @@ function makeNotifier(bot) {
     }
   }
 
+  // Per-chat throttle: Telegram allows ~1 msg/sec to the same chat.
+  // We err on the safe side at 1.5 s.
+  const PER_CHAT_DELAY_MS = 1500;
+  const lastChatSend = new Map();
+  async function throttleChat(chatId) {
+    const now = Date.now();
+    const last = lastChatSend.get(String(chatId)) || 0;
+    const wait = PER_CHAT_DELAY_MS - (now - last);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastChatSend.set(String(chatId), Date.now());
+  }
+
   async function mirrorToAdmins({ originalText, managerName, leadId, type }) {
     const admins = adminChats.list();
     if (!admins.length) return false;
@@ -128,6 +140,7 @@ function makeNotifier(bot) {
     let anySent = false;
     for (const admin of admins) {
       const chatId = admin.telegram_chat_id;
+      await throttleChat(chatId);
       try {
         const result = await bot.telegram.sendMessage(chatId, adminText, {
           parse_mode: 'MarkdownV2',
