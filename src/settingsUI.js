@@ -41,7 +41,7 @@ const META = {
       'API. 10 минут — разумный дефолт.',
   },
   NOTIFICATION_COOLDOWN_MINUTES: {
-    label: '🔁 Минимальная пауза между повторами (на этап)',
+    label: '🔁 Минимальная пауза между повторами на этап',
     short: 'Cooldown',
     unit: 'минут',
     presets: [15, 30, 60, 180, 360],
@@ -64,13 +64,13 @@ function mainText() {
   const s = settings.snapshot();
   return (
     `⚙️ *Настройки бота*\n\n` +
-    `${META.STALE_LEAD_MINUTES.label}\n` +
-    `  Сейчас: *${s.STALE_LEAD_MINUTES} мин* \\(${formatMinutes(s.STALE_LEAD_MINUTES)}\\)\n\n` +
-    `${META.UNANSWERED_MESSAGE_MINUTES.label}\n` +
-    `  Сейчас: *${s.UNANSWERED_MESSAGE_MINUTES} мин* \\(${formatMinutes(s.UNANSWERED_MESSAGE_MINUTES)}\\)\n\n` +
-    `${META.CRON_INTERVAL_MINUTES.label}\n` +
+    `${escapeMd(META.STALE_LEAD_MINUTES.label)}\n` +
+    `  Сейчас: *${s.STALE_LEAD_MINUTES} мин* \\(${escapeMd(formatMinutes(s.STALE_LEAD_MINUTES))}\\)\n\n` +
+    `${escapeMd(META.UNANSWERED_MESSAGE_MINUTES.label)}\n` +
+    `  Сейчас: *${s.UNANSWERED_MESSAGE_MINUTES} мин* \\(${escapeMd(formatMinutes(s.UNANSWERED_MESSAGE_MINUTES))}\\)\n\n` +
+    `${escapeMd(META.CRON_INTERVAL_MINUTES.label)}\n` +
     `  Сейчас: *${s.CRON_INTERVAL_MINUTES} мин*\n\n` +
-    `${META.NOTIFICATION_COOLDOWN_MINUTES.label}\n` +
+    `${escapeMd(META.NOTIFICATION_COOLDOWN_MINUTES.label)}\n` +
     `  Сейчас: *${s.NOTIFICATION_COOLDOWN_MINUTES} мин*\n\n` +
     `🚫 *Игнорируемые этапы*\n` +
     `  ${s.IGNORED_STAGE_IDS.length ? escapeMd(s.IGNORED_STAGE_IDS.join(', ')) : '\\(нет\\)'}\n\n` +
@@ -118,8 +118,8 @@ function editText(key) {
   const meta = META[key];
   const current = settings.getInt(key);
   return (
-    `${meta.label}\n\n` +
-    `*Текущее значение:* ${current} ${meta.unit} \\(${escapeMd(formatMinutes(current))}\\)\n\n` +
+    `${escapeMd(meta.label)}\n\n` +
+    `*Текущее значение:* ${current} ${escapeMd(meta.unit)} \\(${escapeMd(formatMinutes(current))}\\)\n\n` +
     `_${escapeMd(meta.help)}_\n\n` +
     `Выберите пресет или нажмите «Своё значение»:`
   );
