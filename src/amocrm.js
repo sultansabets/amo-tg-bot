@@ -2,7 +2,50 @@ const axios = require('axios');
 const config = require('./config');
 const { tokens } = require('./db');
 
-const baseURL = `https://${config.amo.domain}`;
+// OAuth endpoints (token exchange/refresh) live on the tenant domain.
+const oauthBaseURL = `https://${config.amo.domain}`;
+
+// API endpoints (/api/v4/*) may live on a separate api_domain that amoCRM
+// embeds inside the JWT (api_domain claim, e.g. api-b.amocrm.ru). Long-lived
+// tokens issued by recent amoCRM are bound to that api_domain and the tenant
+// host returns nginx 403 when hit directly. We decode the JWT once and cache
+// the resolved API base URL. `AMO_API_DOMAIN` in .env overrides everything.
+let apiBaseURLCache = null;
+
+function decodeJwtPayload(jwt) {
+  try {
+    const parts = String(jwt || '').split('.');
+    if (parts.length < 2) return null;
+    let p = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (p.length % 4) p += '=';
+    return JSON.parse(Buffer.from(p, 'base64').toString('utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+function resolveApiBaseURL() {
+  if (apiBaseURLCache) return apiBaseURLCache;
+  if (process.env.AMO_API_DOMAIN) {
+    apiBaseURLCache = `https://${process.env.AMO_API_DOMAIN.replace(/^https?:\/\//, '')}`;
+    return apiBaseURLCache;
+  }
+  const stored = tokens.get();
+  const token =
+    (stored && stored.access_token) || config.amo.accessToken || '';
+  const payload = decodeJwtPayload(token);
+  if (payload && payload.api_domain) {
+    apiBaseURLCache = `https://${payload.api_domain}`;
+    console.log(`✅ amoCRM API base: ${apiBaseURLCache} (from token api_domain)`);
+    return apiBaseURLCache;
+  }
+  apiBaseURLCache = oauthBaseURL;
+  return apiBaseURLCache;
+}
+
+function invalidateApiBaseURLCache() {
+  apiBaseURLCache = null;
+}
 
 function getStoredTokens() {
   const row = tokens.get();
@@ -24,7 +67,7 @@ async function refreshAccessToken() {
     throw new Error('No refresh_token available');
   }
 
-  const resp = await axios.post(`${baseURL}/oauth2/access_token`, {
+  const resp = await axios.post(`${oauthBaseURL}/oauth2/access_token`, {
     client_id: config.amo.clientId,
     client_secret: config.amo.clientSecret,
     grant_type: 'refresh_token',
@@ -39,12 +82,13 @@ async function refreshAccessToken() {
     refresh_token: data.refresh_token,
     expires_at,
   });
+  invalidateApiBaseURLCache();
   console.log('🔄 amoCRM: token refreshed');
   return data.access_token;
 }
 
 async function exchangeCode(code) {
-  const resp = await axios.post(`${baseURL}/oauth2/access_token`, {
+  const resp = await axios.post(`${oauthBaseURL}/oauth2/access_token`, {
     client_id: config.amo.clientId,
     client_secret: config.amo.clientSecret,
     grant_type: 'authorization_code',
@@ -58,6 +102,7 @@ async function exchangeCode(code) {
     refresh_token: data.refresh_token,
     expires_at,
   });
+  invalidateApiBaseURLCache();
   return data;
 }
 
@@ -83,11 +128,14 @@ async function getValidAccessToken() {
 async function request(method, url, options = {}, _retried = false) {
   try {
     const token = await getValidAccessToken();
+    const apiBase = resolveApiBaseURL();
     const resp = await axios({
       method,
-      url: `${baseURL}${url}`,
+      url: `${apiBase}${url}`,
       headers: {
         Authorization: `Bearer ${token}`,
+        'User-Agent': 'amo-tg-bot/1.0',
+        Accept: 'application/json',
         ...(options.headers || {}),
       },
       params: options.params,
@@ -201,7 +249,9 @@ async function getLeadFullInfo(leadId) {
 }
 
 module.exports = {
-  baseURL,
+  oauthBaseURL,
+  resolveApiBaseURL,
+  invalidateApiBaseURLCache,
   getValidAccessToken,
   refreshAccessToken,
   exchangeCode,
