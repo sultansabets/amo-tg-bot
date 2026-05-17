@@ -109,6 +109,7 @@ function mainKeyboard() {
         'st_edit_NOTIFICATION_COOLDOWN_MINUTES'
       ),
     ],
+    [Markup.button.callback('🎯 Мониторить ТОЛЬКО эти этапы', 'st_mstages')],
     [Markup.button.callback('🚫 Игнорируемые этапы', 'st_stages')],
     [Markup.button.callback('❓ Что это всё значит?', 'st_help')],
   ]);
@@ -217,19 +218,11 @@ async function renderHelp(ctx) {
   }
 }
 
-// ----- Stages UI -----
+// ----- Stages UI (shared between ignored and monitored modes) -----
 
-async function renderStages(ctx, page = 0) {
+async function fetchStageItems() {
   const data = await amocrm.request('GET', '/api/v4/leads/pipelines');
-  if (!data || !data._embedded) {
-    return ctx.reply(
-      '❌ Не удалось получить воронки из amoCRM.\n\nВозможно проблема с токеном или временной блок API.'
-    );
-  }
-
-  const ignored = new Set(settings.getIdList('IGNORED_STAGE_IDS'));
-
-  // Flatten stages into a single list with pipeline labels
+  if (!data || !data._embedded) return null;
   const items = [];
   for (const p of data._embedded.pipelines || []) {
     for (const s of (p._embedded && p._embedded.statuses) || []) {
@@ -241,6 +234,18 @@ async function renderStages(ctx, page = 0) {
       });
     }
   }
+  return items;
+}
+
+async function renderStages(ctx, page = 0) {
+  const items = await fetchStageItems();
+  if (!items) {
+    return ctx.reply(
+      '❌ Не удалось получить воронки из amoCRM.\n\nВозможно проблема с токеном или временной блок API.'
+    );
+  }
+
+  const ignored = new Set(settings.getIdList('IGNORED_STAGE_IDS'));
 
   const PAGE = 8;
   const totalPages = Math.max(1, Math.ceil(items.length / PAGE));
@@ -265,7 +270,6 @@ async function renderStages(ctx, page = 0) {
     );
   }
 
-  // Buttons: one per stage
   const rows = slice.map((it) => {
     const mark = ignored.has(it.id) ? '✅' : '⬜️';
     return [
@@ -276,7 +280,6 @@ async function renderStages(ctx, page = 0) {
     ];
   });
 
-  // Pagination row
   const nav = [];
   if (page > 0) nav.push(Markup.button.callback('◀️', `st_stgp_${page - 1}`));
   nav.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'st_noop'));
@@ -284,6 +287,81 @@ async function renderStages(ctx, page = 0) {
     nav.push(Markup.button.callback('▶️', `st_stgp_${page + 1}`));
   if (nav.length) rows.push(nav);
 
+  rows.push([Markup.button.callback('◀️ К настройкам', 'st_main')]);
+
+  const text = lines.join('\n');
+  const kb = Markup.inlineKeyboard(rows);
+
+  try {
+    await ctx.editMessageText(text, {
+      parse_mode: 'MarkdownV2',
+      reply_markup: kb.reply_markup,
+    });
+  } catch (_) {
+    await ctx.reply(text, {
+      parse_mode: 'MarkdownV2',
+      reply_markup: kb.reply_markup,
+    });
+  }
+}
+
+async function renderMonitoredStages(ctx, page = 0) {
+  const items = await fetchStageItems();
+  if (!items) {
+    return ctx.reply(
+      '❌ Не удалось получить воронки из amoCRM.\n\nВозможно проблема с токеном или временной блок API.'
+    );
+  }
+
+  const monitored = new Set(settings.getIdList('MONITORED_STAGE_IDS'));
+  const monitorAll = monitored.size === 0;
+
+  const PAGE = 8;
+  const totalPages = Math.max(1, Math.ceil(items.length / PAGE));
+  page = Math.max(0, Math.min(page, totalPages - 1));
+  const slice = items.slice(page * PAGE, page * PAGE + PAGE);
+
+  let lines = [
+    '🎯 *Мониторить ТОЛЬКО эти этапы*',
+    '',
+    monitorAll
+      ? '_Сейчас: список пуст → мониторятся ВСЕ этапы \\(кроме игнорируемых\\)_'
+      : `_Сейчас выбрано: ${monitored.size} этап\\(ов\\)_`,
+    '',
+    'Отметьте ✅ те этапы, по которым бот должен следить за лидами\\.',
+    'Если список пуст → следит за всеми \\(кроме явно игнорируемых\\)\\.',
+    '',
+    `_Страница ${page + 1} из ${totalPages}_`,
+    '',
+  ];
+  for (const it of slice) {
+    const mark = monitored.has(it.id) ? '✅' : '⬜️';
+    const closed = it.closed ? ' 🔒' : '';
+    lines.push(
+      `${mark} *${escapeMd(it.name)}*${closed} _\\(${escapeMd(it.pipeline)}\\)_`
+    );
+  }
+
+  const rows = slice.map((it) => {
+    const mark = monitored.has(it.id) ? '✅' : '⬜️';
+    return [
+      Markup.button.callback(
+        `${mark} ${truncate(it.name, 30)}`,
+        `st_mst_${it.id}_${page}`
+      ),
+    ];
+  });
+
+  const nav = [];
+  if (page > 0) nav.push(Markup.button.callback('◀️', `st_mstp_${page - 1}`));
+  nav.push(Markup.button.callback(`${page + 1}/${totalPages}`, 'st_noop'));
+  if (page < totalPages - 1)
+    nav.push(Markup.button.callback('▶️', `st_mstp_${page + 1}`));
+  if (nav.length) rows.push(nav);
+
+  rows.push([
+    Markup.button.callback('🗑 Очистить (= все этапы)', 'st_mstclear'),
+  ]);
   rows.push([Markup.button.callback('◀️ К настройкам', 'st_main')]);
 
   const text = lines.join('\n');
@@ -429,6 +507,45 @@ function register(bot, isAdminChat) {
 
   bot.action('st_noop', async (ctx) => {
     await ctx.answerCbQuery();
+  });
+
+  // ----- Monitored stages mode -----
+
+  bot.action('st_mstages', async (ctx) => {
+    if (!guard(ctx)) return;
+    await renderMonitoredStages(ctx, 0);
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/^st_mstp_(\d+)$/, async (ctx) => {
+    if (!guard(ctx)) return;
+    const page = parseInt(ctx.match[1], 10) || 0;
+    await renderMonitoredStages(ctx, page);
+    await ctx.answerCbQuery();
+  });
+
+  bot.action(/^st_mst_(\d+)_(\d+)$/, async (ctx) => {
+    if (!guard(ctx)) return;
+    const stageId = parseInt(ctx.match[1], 10);
+    const page = parseInt(ctx.match[2], 10) || 0;
+    const monitored = settings.getIdList('MONITORED_STAGE_IDS');
+    const idx = monitored.indexOf(stageId);
+    if (idx >= 0) {
+      monitored.splice(idx, 1);
+      await ctx.answerCbQuery('Снято с мониторинга');
+    } else {
+      monitored.push(stageId);
+      await ctx.answerCbQuery('Добавлено в мониторинг');
+    }
+    settings.set('MONITORED_STAGE_IDS', monitored.join(','));
+    await renderMonitoredStages(ctx, page);
+  });
+
+  bot.action('st_mstclear', async (ctx) => {
+    if (!guard(ctx)) return;
+    settings.set('MONITORED_STAGE_IDS', '');
+    await ctx.answerCbQuery('Очищено — теперь мониторятся все этапы');
+    await renderMonitoredStages(ctx, 0);
   });
 
   // Intercept plain text for pending custom-value flow.
