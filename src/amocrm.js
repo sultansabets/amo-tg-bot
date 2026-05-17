@@ -26,20 +26,17 @@ function decodeJwtPayload(jwt) {
 
 function resolveApiBaseURL() {
   if (apiBaseURLCache) return apiBaseURLCache;
+  // Explicit override always wins
   if (process.env.AMO_API_DOMAIN) {
     apiBaseURLCache = `https://${process.env.AMO_API_DOMAIN.replace(/^https?:\/\//, '')}`;
+    console.log(`✅ amoCRM API base: ${apiBaseURLCache} (from AMO_API_DOMAIN env)`);
     return apiBaseURLCache;
   }
-  const stored = tokens.get();
-  const token =
-    (stored && stored.access_token) || config.amo.accessToken || '';
-  const payload = decodeJwtPayload(token);
-  if (payload && payload.api_domain) {
-    apiBaseURLCache = `https://${payload.api_domain}`;
-    console.log(`✅ amoCRM API base: ${apiBaseURLCache} (from token api_domain)`);
-    return apiBaseURLCache;
-  }
+  // Default: use the tenant subdomain. The api_domain claim in JWT is
+  // informational and not always accepted directly (e.g. api-b.amocrm.ru
+  // returns 401 "Account not found" when called without account context).
   apiBaseURLCache = oauthBaseURL;
+  console.log(`✅ amoCRM API base: ${apiBaseURLCache} (tenant subdomain)`);
   return apiBaseURLCache;
 }
 
