@@ -3,6 +3,7 @@ const config = require('./config');
 const settings = require('./settings');
 const amocrm = require('./amocrm');
 const scheduler = require('./scheduler');
+const settingsUI = require('./settingsUI');
 const { userMapping, stageTracking, messageTracking, db, adminChats } = require('./db');
 const {
   buildStaleMessage,
@@ -18,11 +19,13 @@ function build() {
   bot.start(async (ctx) => {
     const chatId = ctx.chat.id;
     await ctx.reply(
-      `Привет!\n` +
-        `Это amo-tg-bot — уведомляет о зависших лидах и пропущенных сообщениях.\n\n` +
-        `Ваш chat_id: ${chatId}\n\n` +
-        `Чтобы получать уведомления, привяжите свой amoCRM user_id командой:\n` +
-        `/addme <amo_user_id>`
+      `👋 Привет!\n\n` +
+        `Я amo-tg-bot. Я слежу за лидами в amoCRM и пишу менеджеру, ` +
+        `когда лид завис на этапе или клиент остался без ответа.\n\n` +
+        `🆔 Ваш chat_id: ${chatId}\n\n` +
+        `Чтобы получать уведомления — привяжите свой amoCRM user_id:\n` +
+        `/addme <amo_user_id>\n\n` +
+        `📘 Полная справка: /help`
     );
   });
 
@@ -169,125 +172,8 @@ function build() {
     await ctx.reply('Выберите отчёт:', Markup.inlineKeyboard(buttons));
   });
 
-  // ----- Admin settings -----
-
-  const NUM_KEYS = [
-    'STALE_LEAD_MINUTES',
-    'UNANSWERED_MESSAGE_MINUTES',
-    'CRON_INTERVAL_MINUTES',
-    'NOTIFICATION_COOLDOWN_MINUTES',
-  ];
-  const LIST_KEYS = ['MONITORED_STAGE_IDS', 'IGNORED_STAGE_IDS'];
-
-  bot.command('settings', async (ctx) => {
-    if (!isAdminChat(ctx.chat.id)) return ctx.reply('⛔ Недостаточно прав');
-    const s = settings.snapshot();
-    const text =
-      `⚙️ Текущие настройки\n\n` +
-      `⏱ STALE_LEAD_MINUTES = ${s.STALE_LEAD_MINUTES}\n` +
-      `⏱ UNANSWERED_MESSAGE_MINUTES = ${s.UNANSWERED_MESSAGE_MINUTES}\n` +
-      `⏱ CRON_INTERVAL_MINUTES = ${s.CRON_INTERVAL_MINUTES}\n` +
-      `⏱ NOTIFICATION_COOLDOWN_MINUTES = ${s.NOTIFICATION_COOLDOWN_MINUTES}\n\n` +
-      `🎯 MONITORED_STAGE_IDS = ${s.MONITORED_STAGE_IDS.join(',') || '(все)'}\n` +
-      `🎯 IGNORED_STAGE_IDS = ${s.IGNORED_STAGE_IDS.join(',') || '(нет)'}\n\n` +
-      `Команды:\n` +
-      `/set <КЛЮЧ> <ЗНАЧЕНИЕ> — изменить\n` +
-      `/reset <КЛЮЧ> — вернуть значение из .env\n` +
-      `/stages — список этапов amoCRM с состоянием`;
-    await ctx.reply(text);
-  });
-
-  bot.command('set', async (ctx) => {
-    if (!isAdminChat(ctx.chat.id)) return ctx.reply('⛔ Недостаточно прав');
-    const text = (ctx.message.text || '').trim();
-    const m = text.match(/^\/set(?:@\w+)?\s+(\S+)\s+(.+)$/);
-    if (!m) {
-      return ctx.reply(
-        'Использование:\n' +
-          '/set STALE_LEAD_MINUTES 120\n' +
-          '/set IGNORED_STAGE_IDS 142,143,9876\n' +
-          '/set MONITORED_STAGE_IDS  (пустое значение = все этапы)'
-      );
-    }
-    const key = m[1].toUpperCase();
-    const rawValue = m[2].trim();
-
-    if (!settings.KEYS.includes(key)) {
-      return ctx.reply(`❌ Неизвестный ключ: ${key}\nДоступны: ${settings.KEYS.join(', ')}`);
-    }
-
-    if (NUM_KEYS.includes(key)) {
-      const n = parseInt(rawValue, 10);
-      if (!Number.isFinite(n) || n < 1) {
-        return ctx.reply(`❌ Значение должно быть положительным числом`);
-      }
-      settings.set(key, n);
-      if (key === 'CRON_INTERVAL_MINUTES') scheduler.restart();
-      return ctx.reply(`✅ ${key} = ${n}`);
-    }
-
-    if (LIST_KEYS.includes(key)) {
-      const ids = rawValue
-        .split(',')
-        .map((x) => x.trim())
-        .filter(Boolean)
-        .map((x) => parseInt(x, 10));
-      if (ids.some((x) => !Number.isFinite(x))) {
-        return ctx.reply('❌ Список должен состоять из чисел через запятую');
-      }
-      settings.set(key, ids.join(','));
-      return ctx.reply(`✅ ${key} = ${ids.join(',') || '(пусто)'}`);
-    }
-  });
-
-  bot.command('reset', async (ctx) => {
-    if (!isAdminChat(ctx.chat.id)) return ctx.reply('⛔ Недостаточно прав');
-    const text = (ctx.message.text || '').trim();
-    const m = text.match(/^\/reset(?:@\w+)?\s+(\S+)$/);
-    if (!m) return ctx.reply('Использование: /reset <КЛЮЧ>');
-    const key = m[1].toUpperCase();
-    if (!settings.KEYS.includes(key)) {
-      return ctx.reply(`❌ Неизвестный ключ: ${key}`);
-    }
-    settings.reset(key);
-    if (key === 'CRON_INTERVAL_MINUTES') scheduler.restart();
-    const fallback = settings.envDefault(key);
-    await ctx.reply(`✅ ${key} сброшен → ${fallback || '(пусто)'}`);
-  });
-
-  bot.command('stages', async (ctx) => {
-    if (!isAdminChat(ctx.chat.id)) return ctx.reply('⛔ Недостаточно прав');
-
-    const data = await amocrm.request('GET', '/api/v4/leads/pipelines');
-    if (!data || !data._embedded) {
-      return ctx.reply('❌ Не удалось получить воронки из amoCRM');
-    }
-
-    const monitored = new Set(settings.getIdList('MONITORED_STAGE_IDS'));
-    const ignored = new Set(settings.getIdList('IGNORED_STAGE_IDS'));
-    const monitorAll = monitored.size === 0;
-
-    const lines = ['📍 Этапы amoCRM:', ''];
-    for (const p of data._embedded.pipelines || []) {
-      lines.push(`▼ Воронка: ${p.name} (id=${p.id})`);
-      for (const s of (p._embedded && p._embedded.statuses) || []) {
-        let mark = '👁';
-        if (ignored.has(s.id)) mark = '🚫';
-        else if (!monitorAll && !monitored.has(s.id)) mark = '·';
-        const closed = s.type === 1 ? '  🔒' : '';
-        lines.push(`  ${mark} ${s.id}  ${s.name}${closed}`);
-      }
-      lines.push('');
-    }
-    lines.push(
-      'Легенда: 👁 — мониторим, 🚫 — игнорируем, · — не в списке monitored',
-      '',
-      'Чтобы изменить:',
-      '/set IGNORED_STAGE_IDS 142,143,…',
-      '/set MONITORED_STAGE_IDS 100,101,…  (пусто = все)'
-    );
-    await ctx.reply(lines.join('\n'));
-  });
+  // ----- Admin settings (interactive UI) -----
+  const ui = settingsUI.register(bot, isAdminChat);
 
   bot.action('report_all', async (ctx) => {
     try {
@@ -367,13 +253,21 @@ function build() {
 
   bot.on('message', async (ctx, next) => {
     if (ctx.message.text && ctx.message.text.startsWith('/')) return next();
+
+    // Pending "custom value" flow in /settings menu
+    if (isAdminChat(ctx.chat.id) && ui && ui.maybeHandleCustomInput) {
+      const handled = await ui.maybeHandleCustomInput(ctx);
+      if (handled) return;
+    }
+
     if (isAdminChat(ctx.chat.id)) return;
     const m = userMapping.byChatId(ctx.chat.id);
     if (!m) {
       await ctx.reply(
         `Вы пока не привязаны к amoCRM-пользователю.\n` +
           `Ваш chat_id: ${ctx.chat.id}\n` +
-          `Привяжите аккаунт: /addme <amo_user_id>`
+          `Привяжите аккаунт: /addme <amo_user_id>\n\n` +
+          `Если не знаете свой amo_user_id — спросите у админа или используйте /help`
       );
     }
   });
