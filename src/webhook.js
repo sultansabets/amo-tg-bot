@@ -1,5 +1,6 @@
 const express = require('express');
 const config = require('./config');
+const settings = require('./settings');
 const amocrm = require('./amocrm');
 const { stageTracking, messageTracking, userMapping } = require('./db');
 
@@ -28,12 +29,13 @@ function collectEntities(payload, entityKey) {
 }
 
 function isIgnoredStage(statusId) {
-  return config.ignoredStageIds.includes(parseInt(statusId, 10));
+  return settings.getIdList('IGNORED_STAGE_IDS').includes(parseInt(statusId, 10));
 }
 
 function isMonitoredStage(statusId) {
-  if (!config.monitoredStageIds.length) return true;
-  return config.monitoredStageIds.includes(parseInt(statusId, 10));
+  const monitored = settings.getIdList('MONITORED_STAGE_IDS');
+  if (!monitored.length) return true;
+  return monitored.includes(parseInt(statusId, 10));
 }
 
 function resolveContext(leadId, leadInfo) {

@@ -120,11 +120,12 @@ function makeNotifier(bot) {
 
   async function mirrorToAdmins({ originalText, managerName, leadId, type }) {
     const admins = adminChats.list();
-    if (!admins.length) return;
+    if (!admins.length) return false;
 
     const header = `👁 Уведомление → ${escapeMd(managerName || '—')}`;
     const adminText = `${header}\n${originalText}`;
 
+    let anySent = false;
     for (const admin of admins) {
       const chatId = admin.telegram_chat_id;
       try {
@@ -148,6 +149,7 @@ function makeNotifier(bot) {
           text: adminText,
           success: true,
         });
+        anySent = true;
       } catch (err) {
         console.warn(`⚠️ Admin mirror to chat=${chatId} failed: ${err.message}`);
         notificationLog.add({
@@ -161,6 +163,7 @@ function makeNotifier(bot) {
         });
       }
     }
+    return anySent;
   }
 
   async function notifyAmoUser(amoUserId, text, meta = {}) {
@@ -185,14 +188,17 @@ function makeNotifier(bot) {
     }
 
     // Admin mirror — runs even if manager isn't mapped, so admins always see alerts.
-    await mirrorToAdmins({
+    const adminSent = await mirrorToAdmins({
       originalText: text,
       managerName,
       leadId: meta.lead_id,
       type: meta.type,
     });
 
-    return managerSent;
+    // Treat the notification as "delivered" if at least someone got it
+    // (manager OR admin). Otherwise the scheduler will keep re-trying
+    // every cron tick because last_notified_at stays 0.
+    return managerSent || adminSent;
   }
 
   async function resolveLead(leadId, leadName, managerName) {

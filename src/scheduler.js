@@ -1,5 +1,6 @@
 const cron = require('node-cron');
 const config = require('./config');
+const settings = require('./settings');
 const amocrm = require('./amocrm');
 const { stageTracking, messageTracking } = require('./db');
 const {
@@ -11,10 +12,10 @@ const {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function checkStaleLeads(notifier) {
-  const stale = stageTracking.findStale(
-    config.staleLeadMinutes * 60,
-    config.notificationCooldownMinutes * 60
-  );
+  const staleMin = settings.getInt('STALE_LEAD_MINUTES');
+  const cooldownMin = settings.getInt('NOTIFICATION_COOLDOWN_MINUTES');
+  const ignored = settings.getIdList('IGNORED_STAGE_IDS');
+  const stale = stageTracking.findStale(staleMin * 60, cooldownMin * 60);
 
   let sent = 0;
   for (const row of stale) {
@@ -35,7 +36,7 @@ async function checkStaleLeads(notifier) {
       stageName = info.stageName || stageName;
       hasOpenTask = info.hasOpenTask;
 
-      if (info.lead.status_id && config.ignoredStageIds.includes(info.lead.status_id)) {
+      if (info.lead.status_id && ignored.includes(info.lead.status_id)) {
         stageTracking.remove(row.lead_id);
         continue;
       }
@@ -65,7 +66,9 @@ async function checkStaleLeads(notifier) {
 }
 
 async function checkUnansweredMessages(notifier) {
-  const list = messageTracking.findUnanswered(config.unansweredMessageMinutes * 60);
+  const unansweredMin = settings.getInt('UNANSWERED_MESSAGE_MINUTES');
+  const ignored = settings.getIdList('IGNORED_STAGE_IDS');
+  const list = messageTracking.findUnanswered(unansweredMin * 60);
 
   let sent = 0;
   for (const row of list) {
@@ -84,7 +87,7 @@ async function checkUnansweredMessages(notifier) {
       stageName = info.stageName || stageName;
       hasOpenTask = info.hasOpenTask;
 
-      if (info.lead.status_id && config.ignoredStageIds.includes(info.lead.status_id)) {
+      if (info.lead.status_id && ignored.includes(info.lead.status_id)) {
         messageTracking.clearByLead(row.lead_id);
         continue;
       }
@@ -131,14 +134,31 @@ async function runOnce(notifier) {
   }
 }
 
+let currentTask = null;
+let currentInterval = 0;
+let currentNotifier = null;
+
 function start(notifier) {
-  const expr = `*/${Math.max(1, config.cronIntervalMinutes)} * * * *`;
-  const task = cron.schedule(expr, () => runOnce(notifier), {
+  currentNotifier = notifier;
+  return restart();
+}
+
+function restart() {
+  const interval = Math.max(1, settings.getInt('CRON_INTERVAL_MINUTES'));
+  if (currentTask && currentInterval === interval) return currentTask;
+
+  if (currentTask) {
+    try { currentTask.stop(); } catch (_) {}
+  }
+
+  const expr = `*/${interval} * * * *`;
+  currentTask = cron.schedule(expr, () => runOnce(currentNotifier), {
     scheduled: true,
     timezone: config.timezone,
   });
+  currentInterval = interval;
   console.log(`✅ Scheduler started: ${expr} (${config.timezone})`);
-  return task;
+  return currentTask;
 }
 
-module.exports = { start, runOnce, checkStaleLeads, checkUnansweredMessages };
+module.exports = { start, restart, runOnce, checkStaleLeads, checkUnansweredMessages };

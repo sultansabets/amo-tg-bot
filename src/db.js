@@ -74,6 +74,12 @@ db.exec(`
     name             TEXT,
     created_at       INTEGER DEFAULT (strftime('%s','now'))
   );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT,
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
+  );
 `);
 
 // Safe migration: add role column if missing
@@ -133,13 +139,17 @@ const stageTracking = {
 
   findStale(staleSeconds, cooldownSeconds) {
     const now = Math.floor(Date.now() / 1000);
+    // ONE notification per stage entry. stage_tracking.upsert() resets
+    // last_notified_at to 0 when the stage changes, so a new stage always
+    // re-arms the alert. cooldownSeconds is kept for backwards compat but
+    // is effectively ignored now (set to a huge value to honor "once").
     return db
       .prepare(
         `SELECT * FROM stage_tracking
          WHERE entered_at <= ?
-           AND (last_notified_at = 0 OR last_notified_at <= ?)`
+           AND last_notified_at = 0`
       )
-      .all(now - staleSeconds, now - cooldownSeconds);
+      .all(now - staleSeconds);
   },
 
   markNotified(leadId) {
@@ -244,6 +254,27 @@ const userMapping = {
     return db
       .prepare("SELECT COUNT(*) AS c FROM user_mapping WHERE active = 1 AND role = 'admin'")
       .get().c;
+  },
+};
+
+const settings = {
+  get(key) {
+    return db.prepare('SELECT * FROM settings WHERE key = ?').get(key);
+  },
+  set(key, value) {
+    db.prepare(
+      `INSERT INTO settings (key, value, updated_at)
+       VALUES (?, ?, strftime('%s','now'))
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`
+    ).run(key, value == null ? '' : String(value));
+  },
+  unset(key) {
+    db.prepare('DELETE FROM settings WHERE key = ?').run(key);
+  },
+  all() {
+    return db.prepare('SELECT * FROM settings').all();
   },
 };
 
@@ -354,4 +385,5 @@ module.exports = {
   tokens,
   adminMessages,
   adminChats,
+  settings,
 };
