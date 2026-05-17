@@ -169,13 +169,21 @@ async function request(method, url, options = {}, _retried = false) {
   } catch (err) {
     const status = err.response && err.response.status;
     if (status === 401 && !_retried) {
-      try {
-        await refreshAccessToken();
-        return await request(method, url, options, true);
-      } catch (e) {
-        console.error('❌ amoCRM refresh failed:', e.message);
-        return null;
+      // Only attempt refresh if we actually have a refresh_token.
+      // Long-lived tokens have no refresh_token by design — quietly skip.
+      const stored = getStoredTokens();
+      if (stored && stored.refresh_token) {
+        try {
+          await refreshAccessToken();
+          return await request(method, url, options, true);
+        } catch (e) {
+          console.error('❌ amoCRM refresh failed:', e.message);
+          return null;
+        }
       }
+      // Log once per minute at most so unmapped responsible users don't flood logs
+      console.warn(`⚠️ amoCRM 401 on ${url} (no refresh_token — long-lived token may be expired or revoked)`);
+      return null;
     }
     // 429 Too Many Requests — wait and retry once
     if (status === 429 && !_retried) {
